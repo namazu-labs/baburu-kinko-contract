@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: MIT
+/*
+========================================
+           NAMAZU LABS
+========================================                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+*/
+pragma solidity ^0.8.24;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+    function transferFrom(
+        address from,
+        address to,
+        uint256 value
+    ) external returns (bool);
+}
+
+contract BaburuKinko {
+    struct Order {
+        address borrower;
+        uint256 collateralAmount;
+        uint256 borrowedBnb;
+        uint64 borrowedAt;
+        uint8 status;
+    }
+
+    struct OrderView {
+        uint256 orderId;
+        address borrower;
+        uint256 collateralAmount;
+        uint256 borrowedBnb;
+        uint256 borrowedAt;
+        uint256 penaltyBpsValue;
+        uint256 penaltyAmount;
+        bool repayable;
+        bool liquidatable;
+    }
+
+    uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant EARLY_STAGE_ONE = 1 days;
+    uint256 public constant EARLY_STAGE_TWO = 2 days;
+    uint256 public constant EARLY_STAGE_THREE = 3 days;
+    uint256 public constant NORMAL_STAGE_END = 6 days;
+    uint256 public constant GRACE_STAGE_ONE = 7 days;
+    uint256 public constant GRACE_STAGE_TWO = 8 days;
+    uint256 public constant LIQUIDATION_TIME = 9 days;
+    uint8 public constant ORDER_STATUS_NONE = 0;
+    uint8 public constant ORDER_STATUS_ACTIVE = 1;
+    uint8 public constant ORDER_STATUS_REPAID = 2;
+    uint8 public constant ORDER_STATUS_LIQUIDATED = 3;
+    address public constant DEAD_ADDRESS =
+        0x000000000000000000000000000000000000dEaD;
+
+    IERC20Minimal public baburuToken;
+    address public owner;
+    uint256 public rhoBps = 7000;
+    uint256 public activeCollateral;
+    uint256 public activeOrderCount;
+    uint256 public nextOrderId = 1;
+    bool public borrowPaused = true;
+    bool public started;
+
+    mapping(uint256 => Order) public orders;
+    mapping(address => uint256[]) private borrowerOrderIds;
+    mapping(uint256 => uint256) private borrowerOrderIndex;
+    uint256[] private activeOrderIds;
+    mapping(uint256 => uint256) private activeOrderIndex;
+    mapping(address => bool) public isBlacklist;
+    address[] public blacklistAddresses;
+
+    event Borrowed(
+        uint256 indexed orderId,
+        address indexed borrower,
+        uint256 collateralAmount,
+        uint256 borrowedBnb,
+        uint256 refBorrow,
+        uint256 minBorrowBps
+    );
+    event Repaid(
+        uint256 indexed orderId,
+        address indexed borrower,
+        uint256 returnedCollateral,
+        uint256 repaidBnb,
+        uint256 penaltyAmount
+    );
+    event Liquidated(
+        uint256 indexed orderId,
+        address indexed operator,
+        uint256 burnedCollateral
+    );
+    event BorrowPauseUpdated(bool paused);
+    event RhoUpdated(uint256 rhoBps);
+    event BaburuTokenUpdated(address indexed baburuToken);
+    event BlacklistUpdated(address indexed account, bool blacklisted);
+    event VaultStarted();
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+
+    error NotOwner();
+    error NotStarted();
+    error AlreadyStarted();
+    error BorrowPaused();
+    error InvalidAmount();
+    error InvalidMinBorrowBps();
+    error InvalidDenominator();
+    error SlippageExceeded();
+    error InsufficientTreasury();
+    error NotOrderBorrower();
+    error NotRepayable();
+    error InvalidMsgValue();
+    error TransferFailed();
+    error UnsupportedTokenBehavior();
+    error OrderMissing();
+    error OrderClosed();
+    error DuplicateOrderId();
+    error ReentrantCall();
+
+    uint256 private unlocked = 1;
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier nonReentrant() {
+        if (unlocked != 1) revert ReentrantCall();
+        unlocked = 2;
+        _;
+        unlocked = 1;
+    }
+
+    constructor(address baburuTokenAddress) {
+        if (baburuTokenAddress == address(0)) revert InvalidAmount();
+        baburuToken = IERC20Minimal(baburuTokenAddress);
+        owner = msg.sender;
+        emit BaburuTokenUpdated(baburuTokenAddress);
+        emit OwnershipTransferred(address(0), msg.sender);
+    }
+
+    receive() external payable {}
+
+    function borrow(
+        uint256 collateralAmount,
+        uint256 refBorrow,
+        uint256 minBorrowBps
+    ) external nonReentrant returns (uint256 orderId, uint256 borrowedBnb) {
+        _cleanupFinishedOrders(msg.sender, type(uint256).max);
+
+        if (!started) revert NotStarted();
+        if (borrowPaused) revert BorrowPaused();
+        if (collateralAmount == 0 || refBorrow == 0) revert InvalidAmount();
+        if (minBorrowBps == 0 || minBorrowBps > BPS_DENOMINATOR)
+            revert InvalidMinBorrowBps();
+
+        uint256 treasuryBefore = address(this).balance;
+        uint256 denominator = borrowDenominator();
+        if (denominator == 0) revert InvalidDenominator();
+
+        borrowedBnb =
+            (collateralAmount * treasuryBefore * rhoBps) /
+            denominator /
+            BPS_DENOMINATOR;
+        if (borrowedBnb == 0) revert InvalidAmount();
+        if (borrowedBnb > treasuryBefore) revert InsufficientTreasury();
+        if (borrowedBnb * BPS_DENOMINATOR < refBorrow * minBorrowBps)
+            revert SlippageExceeded();
+
+        _safeTransferFrom(msg.sender, address(this), collateralAmount);
+
+        orderId = nextOrderId++;
+        orders[orderId] = Order({
+            borrower: msg.sender,
+            collateralAmount: collateralAmount,
+            borrowedBnb: borrowedBnb,
+            borrowedAt: uint64(block.timestamp),
+            status: ORDER_STATUS_ACTIVE
+        });
+        borrowerOrderIds[msg.sender].push(orderId);
+        borrowerOrderIndex[orderId] = borrowerOrderIds[msg.sender].length - 1;
+        activeOrderIndex[orderId] = activeOrderIds.length;
+        activeOrderIds.push(orderId);
+        activeCollateral += collateralAmount;
+        activeOrderCount += 1;
+
+        (bool sent, ) = payable(msg.sender).call{value: borrowedBnb}("");
+        if (!sent) revert TransferFailed();
+
+        emit Borrowed(
+            orderId,
+            msg.sender,
+            collateralAmount,
+            borrowedBnb,
+            refBorrow,
+            minBorrowBps
+        );
+    }
+
+    function repay(
+        uint256[] calldata orderIds
+    ) external payable nonReentrant returns (uint256 totalPenalty) {
+        _cleanupFinishedOrders(msg.sender, type(uint256).max);
+
+        uint256 totalBnbDue;
+
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            _revertOnDuplicateOrderId(orderIds, i);
+            Order memory order = orders[orderIds[i]];
+            if (order.borrower == address(0)) revert OrderMissing();
+            if (order.status != ORDER_STATUS_ACTIVE) revert OrderClosed();
+
+            if (_isLiquidatable(order.borrowedAt)) {
+                _liquidate(orderIds[i], msg.sender);
+                continue;
+            }
+
+            if (order.borrower != msg.sender) revert NotOrderBorrower();
+            totalBnbDue += order.borrowedBnb;
+            totalPenalty += _penaltyAmount(
+                order.collateralAmount,
+                order.borrowedAt
+            );
+        }
+
+        if (msg.value != totalBnbDue) revert InvalidMsgValue();
+
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            Order memory order = orders[orderIds[i]];
+            if (order.borrower != msg.sender) {
+                continue;
+            }
+            if (order.status != ORDER_STATUS_ACTIVE) {
+                continue;
+            }
+            if (_isLiquidatable(order.borrowedAt)) {
+                continue;
+            }
+            _closeOrder(
+                orderIds[i],
+                order,
+                _penaltyAmount(order.collateralAmount, order.borrowedAt)
+            );
+        }
+    }
+
+    function liquidate(uint256[] calldata orderIds) external nonReentrant {
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            _revertOnDuplicateOrderId(orderIds, i);
+            _liquidate(orderIds[i], msg.sender);
+        }
+    }
+
+    function cleanupFinishedOrders(
+        uint256 maxCount
+    ) external nonReentrant returns (uint256 cleanedCount) {
+        if (maxCount == 0) revert InvalidAmount();
+        return _cleanupFinishedOrders(msg.sender, maxCount);
+    }
+
+    function liquidateOverdue(
+        uint256 maxCount
+    )
+        external
+        nonReentrant
+        returns (uint256 processedCount, uint256 burnedCollateral)
+    {
+        if (maxCount == 0) revert InvalidAmount();
+
+        for (
+            uint256 i = activeOrderIds.length;
+            i > 0 && processedCount < maxCount;
+
+        ) {
+            unchecked {
+                i--;
+            }
+
+            uint256 orderId = activeOrderIds[i];
+            Order memory order = orders[orderId];
+            if (
+                order.borrower == address(0) ||
+                !_isLiquidatable(order.borrowedAt)
+            ) {
+                continue;
+            }
+
+            burnedCollateral += order.collateralAmount;
+            _liquidate(orderId, msg.sender);
+            processedCount += 1;
+        }
+    }
+
+    function quoteBorrow(
+        uint256 collateralAmount
+    ) external view returns (uint256) {
+        if (!started) return 0;
+        uint256 denominator = borrowDenominator();
+        if (denominator == 0) return 0;
+        return
+            (collateralAmount * address(this).balance * rhoBps) /
+            denominator /
+            BPS_DENOMINATOR;
+    }
+
+    function previewBorrow(
+        uint256 collateralAmount,
+        uint256 refBorrow,
+        uint256 minBorrowBps
+    )
+        external
+        view
+        returns (
+            uint256 borrowedBnb,
+            bool passesSlippage,
+            uint256 denominator,
+            uint256 treasuryBnb
+        )
+    {
+        if (!started) {
+            return (0, false, 0, address(this).balance);
+        }
+        if (minBorrowBps == 0 || minBorrowBps > BPS_DENOMINATOR) {
+            return (0, false, 0, address(this).balance);
+        }
+
+        treasuryBnb = address(this).balance;
+        denominator = borrowDenominator();
+        if (denominator == 0 || collateralAmount == 0) {
+            return (0, false, denominator, treasuryBnb);
+        }
+
+        borrowedBnb =
+            (collateralAmount * treasuryBnb * rhoBps) /
+            denominator /
+            BPS_DENOMINATOR;
+        passesSlippage =
+            borrowedBnb > 0 &&
+            borrowedBnb * BPS_DENOMINATOR >= refBorrow * minBorrowBps;
+    }
+
+    function borrowDenominator() public view returns (uint256) {
+        uint256 inactive = blacklistBalance();
+        if (INITIAL_SUPPLY <= inactive + activeCollateral) {
+            return 0;
+        }
+        return INITIAL_SUPPLY - inactive - activeCollateral;
+    }
+
+    function penaltyBps(uint256 borrowedAt) public view returns (uint256) {
+        uint256 elapsed = block.timestamp - borrowedAt;
+        if (elapsed < EARLY_STAGE_ONE) return 3000;
+        if (elapsed < EARLY_STAGE_TWO) return 2000;
+        if (elapsed < EARLY_STAGE_THREE) return 1000;
+        if (elapsed < NORMAL_STAGE_END) return 0;
+        if (elapsed < GRACE_STAGE_ONE) return 3000;
+        if (elapsed < GRACE_STAGE_TWO) return 6000;
+        if (elapsed < LIQUIDATION_TIME) return 9000;
+        return BPS_DENOMINATOR;
+    }
+
+    function getBorrowerOrders(
+        address borrower
+    ) external view returns (uint256[] memory borrowerActiveOrderIds) {
+        uint256[] memory storedOrderIds = borrowerOrderIds[borrower];
+        uint256 count;
+
+        for (uint256 i = 0; i < storedOrderIds.length; i++) {
+            if (orders[storedOrderIds[i]].status == ORDER_STATUS_ACTIVE) {
+                count++;
+            }
+        }
+
+        borrowerActiveOrderIds = new uint256[](count);
+        uint256 writeIndex;
+        for (uint256 i = 0; i < storedOrderIds.length; i++) {
+            if (orders[storedOrderIds[i]].status == ORDER_STATUS_ACTIVE) {
+                borrowerActiveOrderIds[writeIndex] = storedOrderIds[i];
+                writeIndex++;
+            }
+        }
+    }
+
+    function getBorrowerOrderHistory(
+        address borrower
+    ) external view returns (uint256[] memory borrowerOrderHistoryIds) {
+        borrowerOrderHistoryIds = borrowerOrderIds[borrower];
+    }
+
+    function getActiveOrderIds() external view returns (uint256[] memory ids) {
+        ids = activeOrderIds;
+    }
+
+    function liquidatableSummary()
+        external
+        view
+        returns (uint256 count, uint256 collateral)
+    {
+        for (uint256 i = 0; i < activeOrderIds.length; i++) {
+            uint256 orderId = activeOrderIds[i];
+            Order memory order = orders[orderId];
+            if (
+                order.borrower == address(0) ||
+                !_isLiquidatable(order.borrowedAt)
+            ) {
+                continue;
+            }
+            count += 1;
+            collateral += order.collateralAmount;
+        }
+    }
+
+    function treasurySnapshot()
+        external
+        view
+        returns (
+            uint256 liveBalance,
+            uint256 borrowedOutstanding,
+            uint256 totalManaged
+        )
+    {
+        liveBalance = address(this).balance;
+
+        for (uint256 i = 0; i < activeOrderIds.length; i++) {
+            uint256 orderId = activeOrderIds[i];
+            Order memory order = orders[orderId];
+            if (order.borrower == address(0)) {
+                continue;
+            }
+            borrowedOutstanding += order.borrowedBnb;
+        }
+
+        totalManaged = liveBalance + borrowedOutstanding;
+    }
+
+    function getBorrowerOrderViews(
+        address borrower
+    ) external view returns (OrderView[] memory activeOrders) {
+        uint256[] memory borrowerActiveOrderIds = this.getBorrowerOrders(
+            borrower
+        );
+        activeOrders = new OrderView[](borrowerActiveOrderIds.length);
+
+        for (uint256 i = 0; i < borrowerActiveOrderIds.length; i++) {
+            activeOrders[i] = orderView(borrowerActiveOrderIds[i]);
+        }
+    }
+
+    function orderView(
+        uint256 orderId
+    ) public view returns (OrderView memory viewData) {
+        Order memory order = orders[orderId];
+        if (order.borrower == address(0)) revert OrderMissing();
+
+        bool isActive = order.status == ORDER_STATUS_ACTIVE;
+        uint256 currentPenaltyBps = isActive ? penaltyBps(order.borrowedAt) : 0;
+        bool liquidatable = isActive && currentPenaltyBps == BPS_DENOMINATOR;
+        bool repayable = isActive && !liquidatable;
+
+        viewData = OrderView({
+            orderId: orderId,
+            borrower: order.borrower,
+            collateralAmount: order.collateralAmount,
+            borrowedBnb: order.borrowedBnb,
+            borrowedAt: order.borrowedAt,
+            penaltyBpsValue: currentPenaltyBps,
+            penaltyAmount: isActive
+                ? _penaltyAmount(order.collateralAmount, order.borrowedAt)
+                : 0,
+            repayable: repayable,
+            liquidatable: liquidatable
+        });
+    }
+
+    function previewRepay(
+        address borrower,
+        uint256[] calldata orderIds
+    )
+        external
+        view
+        returns (
+            uint256 totalBnbDue,
+            uint256 totalPenalty,
+            uint256 repayableCount,
+            uint256 liquidatableCount
+        )
+    {
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            _revertOnDuplicateOrderId(orderIds, i);
+            Order memory order = orders[orderIds[i]];
+            if (order.borrower == address(0)) revert OrderMissing();
+            if (order.status != ORDER_STATUS_ACTIVE) revert OrderClosed();
+
+            if (_isLiquidatable(order.borrowedAt)) {
+                liquidatableCount += 1;
+                continue;
+            }
+
+            if (order.borrower != borrower) revert NotOrderBorrower();
+
+            totalBnbDue += order.borrowedBnb;
+            totalPenalty += _penaltyAmount(
+                order.collateralAmount,
+                order.borrowedAt
+            );
+            repayableCount += 1;
+        }
+    }
+
+    function blacklistBalance() public view returns (uint256 total) {
+        if (address(baburuToken) == address(0)) {
+            return 0;
+        }
+        for (uint256 i = 0; i < blacklistAddresses.length; i++) {
+            address account = blacklistAddresses[i];
+            if (account == address(this)) {
+                continue;
+            }
+
+            try baburuToken.balanceOf(account) returns (uint256 balance) {
+                total += balance;
+            } catch {}
+        }
+    }
+
+    function blacklistCount() external view returns (uint256) {
+        return blacklistAddresses.length;
+    }
+
+    function startVault() external onlyOwner {
+        if (started) revert AlreadyStarted();
+        started = true;
+        borrowPaused = false;
+        emit VaultStarted();
+        emit BorrowPauseUpdated(false);
+    }
+
+    function setBorrowPaused(bool paused) external onlyOwner {
+        if (!started) revert NotStarted();
+        borrowPaused = paused;
+        emit BorrowPauseUpdated(paused);
+    }
+
+    function setRhoBps(uint256 newRhoBps) external onlyOwner {
+        if (newRhoBps == 0) revert InvalidAmount();
+        rhoBps = newRhoBps;
+        emit RhoUpdated(newRhoBps);
+    }
+
+    function setBlacklist(
+        address account,
+        bool blacklisted
+    ) external onlyOwner {
+        if (account == address(0) || account == address(this))
+            revert InvalidAmount();
+
+        if (blacklisted && !isBlacklist[account]) {
+            isBlacklist[account] = true;
+            blacklistAddresses.push(account);
+            emit BlacklistUpdated(account, true);
+            return;
+        }
+
+        if (!blacklisted && isBlacklist[account]) {
+            isBlacklist[account] = false;
+            for (uint256 i = 0; i < blacklistAddresses.length; i++) {
+                if (blacklistAddresses[i] == account) {
+                    blacklistAddresses[i] = blacklistAddresses[
+                        blacklistAddresses.length - 1
+                    ];
+                    blacklistAddresses.pop();
+                    break;
+                }
+            }
+            emit BlacklistUpdated(account, false);
+        }
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert InvalidAmount();
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    function _closeOrder(
+        uint256 orderId,
+        Order memory order,
+        uint256 penaltyAmount
+    ) internal {
+        _removeActiveOrder(orderId);
+        activeCollateral -= order.collateralAmount;
+        activeOrderCount -= 1;
+        orders[orderId].status = ORDER_STATUS_REPAID;
+
+        uint256 returnedCollateral = order.collateralAmount;
+        if (penaltyAmount > 0) {
+            _safeTransfer(DEAD_ADDRESS, penaltyAmount);
+            returnedCollateral -= penaltyAmount;
+        }
+        _safeTransfer(msg.sender, returnedCollateral);
+
+        emit Repaid(
+            orderId,
+            msg.sender,
+            returnedCollateral,
+            order.borrowedBnb,
+            penaltyAmount
+        );
+    }
+
+    function _liquidate(uint256 orderId, address operator) internal {
+        Order memory order = orders[orderId];
+        if (order.borrower == address(0)) revert OrderMissing();
+        if (order.status != ORDER_STATUS_ACTIVE) revert OrderClosed();
+        if (!_isLiquidatable(order.borrowedAt)) revert NotRepayable();
+
+        _removeActiveOrder(orderId);
+        activeCollateral -= order.collateralAmount;
+        activeOrderCount -= 1;
+        orders[orderId].status = ORDER_STATUS_LIQUIDATED;
+        _safeTransfer(DEAD_ADDRESS, order.collateralAmount);
+
+        emit Liquidated(orderId, operator, order.collateralAmount);
+    }
+
+    function _penaltyAmount(
+        uint256 collateralAmount,
+        uint256 borrowedAt
+    ) internal view returns (uint256) {
+        return (collateralAmount * penaltyBps(borrowedAt)) / BPS_DENOMINATOR;
+    }
+
+    function _isLiquidatable(uint256 borrowedAt) internal view returns (bool) {
+        return block.timestamp >= borrowedAt + LIQUIDATION_TIME;
+    }
+
+    function _removeActiveOrder(uint256 orderId) internal {
+        uint256 index = activeOrderIndex[orderId];
+        uint256 lastIndex = activeOrderIds.length - 1;
+
+        if (index != lastIndex) {
+            uint256 lastOrderId = activeOrderIds[lastIndex];
+            activeOrderIds[index] = lastOrderId;
+            activeOrderIndex[lastOrderId] = index;
+        }
+
+        activeOrderIds.pop();
+        delete activeOrderIndex[orderId];
+    }
+
+    function _removeBorrowerOrder(address borrower, uint256 orderId) internal {
+        uint256[] storage borrowerOrders = borrowerOrderIds[borrower];
+        uint256 index = borrowerOrderIndex[orderId];
+        uint256 lastIndex = borrowerOrders.length - 1;
+
+        if (index != lastIndex) {
+            uint256 lastOrderId = borrowerOrders[lastIndex];
+            borrowerOrders[index] = lastOrderId;
+            borrowerOrderIndex[lastOrderId] = index;
+        }
+
+        borrowerOrders.pop();
+        delete borrowerOrderIndex[orderId];
+    }
+
+    function _cleanupFinishedOrders(
+        address borrower,
+        uint256 maxCount
+    ) internal returns (uint256 cleanedCount) {
+        uint256[] storage borrowerOrders = borrowerOrderIds[borrower];
+        uint256 index;
+
+        while (index < borrowerOrders.length && cleanedCount < maxCount) {
+            uint256 orderId = borrowerOrders[index];
+            if (orders[orderId].status == ORDER_STATUS_ACTIVE) {
+                index++;
+                continue;
+            }
+
+            _removeBorrowerOrder(borrower, orderId);
+            cleanedCount++;
+        }
+    }
+
+    function _safeTransfer(address to, uint256 value) internal {
+        uint256 senderBalanceBefore = baburuToken.balanceOf(address(this));
+        uint256 receiverBalanceBefore = baburuToken.balanceOf(to);
+        bool ok = baburuToken.transfer(to, value);
+        if (!ok) revert TransferFailed();
+
+        uint256 senderBalanceAfter = baburuToken.balanceOf(address(this));
+        uint256 receiverBalanceAfter = baburuToken.balanceOf(to);
+        if (
+            senderBalanceBefore < value ||
+            senderBalanceBefore - senderBalanceAfter != value ||
+            receiverBalanceAfter - receiverBalanceBefore != value
+        ) revert UnsupportedTokenBehavior();
+    }
+
+    function _safeTransferFrom(
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        uint256 receiverBalanceBefore = baburuToken.balanceOf(to);
+        bool ok = baburuToken.transferFrom(from, to, value);
+        if (!ok) revert TransferFailed();
+
+        uint256 receiverBalanceAfter = baburuToken.balanceOf(to);
+        if (receiverBalanceAfter - receiverBalanceBefore != value)
+            revert UnsupportedTokenBehavior();
+    }
+
+    function _revertOnDuplicateOrderId(
+        uint256[] calldata orderIds,
+        uint256 currentIndex
+    ) internal pure {
+        for (uint256 i = 0; i < currentIndex; i++) {
+            if (orderIds[i] == orderIds[currentIndex])
+                revert DuplicateOrderId();
+        }
+    }
+}
